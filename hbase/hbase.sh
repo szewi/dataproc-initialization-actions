@@ -54,6 +54,68 @@ function install_and_configure_hbase() {
   </configuration>
 EOF
 
+  cat << EOF > /etc/systemd/system/hbase-master.service
+[Unit]
+Description=HBase Master
+Wants=network-online.target
+After=network-online.target hadoop-hdfs-namenode.service
+
+[Service]
+User=root
+Group=root
+Type=simple
+EnvironmentFile=/etc/environment
+Environment=HBASE_HOME=/etc/hbase
+ExecStart=${HBASE_HOME}/bin/hbase  \
+  --config ${HBASE_HOME}/conf/ \
+  master start
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat << EOF > /etc/systemd/system/hbase-regionserver.service
+[Unit]
+Description=HBase Regionserver
+Wants=network-online.target
+After=network-online.target hadoop-hdfs-datanode.service
+
+[Service]
+User=root
+Group=root
+Type=simple
+EnvironmentFile=/etc/environment
+Environment=HBASE_HOME=/etc/hbase
+ExecStart=${HBASE_HOME}/bin/hbase \
+  --config ${HBASE_HOME}/conf/ \
+  regionserver start
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat << EOF > /etc/systemd/system/hbase-zookeeper.service
+[Unit]
+Description=HBase Zookeeper
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+EnvironmentFile=/etc/environment
+Environment=HBASE_HOME=/etc/hbase
+ExecStart=${HBASE_HOME}/bin/hbase \
+  --config ${HBASE_HOME}/conf/ \
+  zookeeper start
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
   if [[ "${MASTER_ADDITIONAL}" != "" ]]; then
     # If true than init action is running on high availability dataproc cluster.
     # HBase will use zookeeper service pre-installed and running on master nodes.
@@ -81,7 +143,7 @@ EOF
       --name 'hbase.rootdir' --value "hdfs://${CLUSTER_NAME}-m:8020/hbase" \
       --clobber
 
-    "${HBASE_HOME}/bin/hbase-daemon.sh" start zookeeper
+    systemctl start hbase-zookeeper
   fi
 
   bdconfig merge_configurations \
@@ -91,7 +153,7 @@ EOF
   
   # On single node clusters we must also start regionserver on it.
   if [[ "${WORKER_COUNT}" -eq 0 ]]; then
-    "${HBASE_HOME}/bin/hbase-daemon.sh" start regionserver
+    systemctl start hbase-regionserver
   fi
 }
 
@@ -102,9 +164,9 @@ function main() {
   install_and_configure_hbase
 
   if [[ "${role}" == 'Master' ]]; then
-    "${HBASE_HOME}/bin/hbase-daemon.sh" start master
+    systemctl start hbase-master
   else
-    "${HBASE_HOME}/bin/hbase-daemon.sh" start regionserver
+    systemctl start hbase-regionserver
   fi
 }
 

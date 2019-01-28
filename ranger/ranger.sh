@@ -16,92 +16,107 @@
 # This initialization action installs Apache Ranger on Dataproc Cluster.
 
 set -euxo pipefail
+
 readonly SOLR_HOME='/opt/solr'
+readonly RANGER_GCS_BUCKET='apache-ranger-1-2-0-artifacts'
 readonly NODE_NAME="$(/usr/share/google/get_metadata_value name)"
+readonly RANGER_INSTALL_DIR='/usr/lib/ranger'
+readonly RANGER_VERSION='1.2.0'
 
-gsutil cp gs://polidea-dataproc-utils/ranger/apache-ranger-1.2.0.tar.gz /tmp/apache-ranger-1.2.0.tar.gz
+function download_and_install_component() {
+  local full_component_name="$(echo ${1} | sed "s/^ranger/ranger-${RANGER_VERSION}/")"
+  gsutil cp "gs://${RANGER_GCS_BUCKET}/${full_component_name}.tar.gz" "${RANGER_INSTALL_DIR}/"
+  tar -xf "${full_component_name}.tar.gz" \
+    && ln -s "${full_component_name}" "${1}" \
+    && rm -f "${full_component_name}.tar.gz"
+}
 
-cd /tmp && tar -xf apache-ranger-1.2.0.tar.gz
-mkdir -p /usr/lib/ranger && cd /usr/lib/ranger
+function configure_admin() {
+  sed -i 's/^db_root_password=/db_root_password=root-password/' \
+    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+  sed -i 's/^db_password=/db_password=rangerpass/' \
+    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+  sed -i 's/^rangerAdmin_password=/rangerAdmin_password=dataproc2019/' \
+    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+  sed -i 's/^audit_solr_urls=/audit_solr_urls=http:\/\/localhost:8983\/solr\/ranger_audits/' \
+    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+  sed -i 's/^audit_solr_user=/audit_solr_user=solr/' \
+    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
 
-#ranger-admin
-tar -xf /tmp/apache-ranger-1.2.0/target/ranger-1.2.0-admin.tar.gz \
-  && ln -s ranger-1.2.0-admin ranger-admin
+  mysql -u root -proot-password -e "CREATE USER 'rangeradmin'@'localhost' IDENTIFIED BY 'rangerpass';"
+  mysql -u root -proot-password -e "CREATE DATABASE ranger;"
+  mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost' ;"
 
-sed -i 's/^db_root_password=/db_root_password=root-password/' \
-  /usr/lib/ranger/ranger-admin/install.properties
-sed -i 's/^db_password=/db_password=rangerpass/' \
-  /usr/lib/ranger/ranger-admin/install.properties
-sed -i 's/^rangerAdmin_password=/rangerAdmin_password=dataproc2019/' \
-  /usr/lib/ranger/ranger-admin/install.properties
-sed -i 's/^audit_solr_urls=/audit_solr_urls=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-  /usr/lib/ranger/ranger-admin/install.properties
-sed -i 's/^audit_solr_user=/audit_solr_user=solr/' \
-  /usr/lib/ranger/ranger-admin/install.properties
+  runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
+}
 
-mysql -u root -proot-password -e "CREATE USER 'rangeradmin'@'localhost' IDENTIFIED BY 'rangerpass';"
-mysql -u root -proot-password -e "CREATE DATABASE ranger;"
-mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost' ;"
+function run_ranger_admin() {
+  download_and_install_component "ranger-admin"
+  configure_admin
+  pushd "${RANGER_INSTALL_DIR}/ranger-admin" && ./setup.sh
+  ranger-admin start
+  popd
+}
 
-runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d /usr/lib/ranger/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
+function add_usersync_plugin() {
+  download_and_install_component "ranger-usersync"
+  mkdir -p /var/log/ranger-usersync && chown ranger /var/log/ranger-usersync \
+    && chgrp ranger /var/log/ranger-usersync
 
-cd /usr/lib/ranger/ranger-admin && ./setup.sh
-ranger-admin start
+  sed -i 's/^logdir=logs/logdir=\/var\/log\/ranger-usersync/' \
+    ${RANGER_INSTALL_DIR}/ranger-usersync/install.properties
+  sed -i 's/^POLICY_MGR_URL =/POLICY_MGR_URL = http:\/\/localhost:6080/' \
+    ${RANGER_INSTALL_DIR}/ranger-usersync/install.properties
 
-#ranger-usersync
-cd /usr/lib/ranger/
-tar -xf /tmp/apache-ranger-1.2.0/target/ranger-1.2.0-usersync.tar.gz \
-  && ln -s ranger-1.2.0-usersync ranger-usersync
+  pushd ${RANGER_INSTALL_DIR}/ranger-usersync && ./setup.sh
+  ranger-usersync start
+  popd
+}
 
-mkdir -p /var/log/ranger-usersync && chown ranger /var/log/ranger-usersync \
-  && chgrp ranger /var/log/ranger-usersync
+#######################################
+# Configure Policy Manager URL, Solar Auditing and Service name
+# Arguments:
+#  plugin_name - name of ranger plugin
+#  service_name - service that will use plugin
+#######################################
+function apply_common_plugin_configuration() {
+  sed -i 's/^POLICY_MGR_URL=/POLICY_MGR_URL=http:\/\/localhost:6080/' \
+    "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  sed -i "s/^REPOSITORY_NAME=/REPOSITORY_NAME=${2}/" \
+    "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  sed -i 's/^XAAUDIT.SOLR.ENABLE=false/XAAUDIT.SOLR.ENABLE=true/' \
+    "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  sed -i 's/^XAAUDIT.SOLR.URL=NONE/XAAUDIT.SOLR.URL=http:\/\/localhost:8983\/solr\/ranger_audits/' \
+    "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  sed -i 's/^XAAUDIT.SOLR.USER=NONE/XAAUDIT.SOLR.USER=solr/' \
+    "${RANGER_INSTALL_DIR}/${1}/install.properties"
+}
 
-sed -i 's/^logdir=logs/logdir=\/var\/log\/ranger-usersync/' \
-  /usr/lib/ranger/ranger-usersync/install.properties
-sed -i 's/^POLICY_MGR_URL =/POLICY_MGR_URL = http:\/\/localhost:6080/' \
-  /usr/lib/ranger/ranger-usersync/install.properties
+function add_hdfs_plugin() {
+  download_and_install_component "ranger-hdfs-plugin"
+  apply_common_plugin_configuration "ranger-hdfs-plugin" "hadoopdev"
 
-cd /usr/lib/ranger/ranger-usersync && ./setup.sh
-ranger-usersync start
+  mkdir -p "${RANGER_INSTALL_DIR}/hadoop/etc" "${RANGER_INSTALL_DIR}/hadoop/share/hadoop/hdfs/"
+  ln -s /etc/hadoop/conf "${RANGER_INSTALL_DIR}/hadoop/etc/hadoop"
+  ln -s /usr/lib/hadoop-hdfs/lib "${RANGER_INSTALL_DIR}/hadoop/share/hadoop/hdfs/"
 
-#ranger-hdfs-plugin
-cd /usr/lib/ranger/
-tar -xf /tmp/apache-ranger-1.2.0/target/ranger-1.2.0-hdfs-plugin.tar.gz \
-  && ln -s ranger-1.2.0-hdfs-plugin ranger-hdfs-plugin
+  pushd ranger-hdfs-plugin && ./enable-hdfs-plugin.sh && popd
 
-sed -i 's/^POLICY_MGR_URL=/POLICY_MGR_URL=http:\/\/localhost:6080/' \
-  /usr/lib/ranger/ranger-hdfs-plugin/install.properties
-sed -i 's/^REPOSITORY_NAME=/REPOSITORY_NAME=hadoopdev/' \
-  /usr/lib/ranger/ranger-hdfs-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.ENABLE=false/XAAUDIT.SOLR.ENABLE=true/' \
-  /usr/lib/ranger/ranger-hdfs-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.URL=NONE/XAAUDIT.SOLR.URL=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-  /usr/lib/ranger/ranger-hdfs-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.USER=NONE/XAAUDIT.SOLR.USER=solr/' \
-  /usr/lib/ranger/ranger-hdfs-plugin/install.properties
-
-mkdir -p /usr/lib/ranger/hadoop/etc
-ln -s /etc/hadoop/conf /usr/lib/ranger/hadoop/etc/hadoop
-mkdir -p /usr/lib/ranger/hadoop/share/hadoop/hdfs/
-ln -s /usr/lib/hadoop-hdfs/lib /usr/lib/ranger/hadoop/share/hadoop/hdfs/
-
-cd /usr/lib/ranger/ranger-hdfs-plugin && ./enable-hdfs-plugin.sh
-
-systemctl stop hadoop-hdfs-datanode.service
-systemctl stop hadoop-hdfs-secondarynamenode.service
-systemctl stop hadoop-hdfs-namenode.service
-systemctl start hadoop-hdfs-namenode.service
-systemctl start hadoop-hdfs-secondarynamenode.service
-systemctl start hadoop-hdfs-datanode.service
+  systemctl stop hadoop-hdfs-datanode.service
+  systemctl stop hadoop-hdfs-secondarynamenode.service
+  systemctl stop hadoop-hdfs-namenode.service
+  systemctl start hadoop-hdfs-namenode.service
+  systemctl start hadoop-hdfs-secondarynamenode.service
+  systemctl start hadoop-hdfs-datanode.service
 
 cat << EOF > service-hdfs.json
 {
     "configs": {
         "password": "dataproc2019",
         "username": "admin",
-	    "hadoop.security.authentication": "Simple",
-	    "hadoop.security.authorization": "No",
-	    "fs.default.name": "hdfs://${NODE_NAME}:8020"
+        "hadoop.security.authentication": "Simple",
+        "hadoop.security.authorization": "No",
+        "fs.default.name": "hdfs://${NODE_NAME}:8020"
         },
     "description": "Hadoop hdfs service",
     "isEnabled": true,
@@ -110,36 +125,24 @@ cat << EOF > service-hdfs.json
     "version": 1
 }
 EOF
-curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
-   -X POST -d @service-hdfs.json http://localhost:6080/service/public/v2/api/service
+  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+    -X POST -d @service-hdfs.json http://localhost:6080/service/public/v2/api/service
+}
 
-#ranger-hive-plugin
-cd /usr/lib/ranger/
-tar -xf /tmp/apache-ranger-1.2.0/target/ranger-1.2.0-hive-plugin.tar.gz \
-  && ln -s ranger-1.2.0-hive-plugin ranger-hive-plugin
+function add_hive_plugin() {
+  download_and_install_component "ranger-hive-plugin"
+  apply_common_plugin_configuration "ranger-hive-plugin" "hivedev"
+  mkdir -p hive \
+    && ln -s /etc/hive/conf hive \
+    && ln -s /usr/lib/hive/lib hive
+  pushd ranger-hive-plugin && ./enable-hive-plugin.sh && popd
 
-sed -i 's/^POLICY_MGR_URL=/POLICY_MGR_URL=http:\/\/localhost:6080/' \
-  /usr/lib/ranger/ranger-hive-plugin/install.properties
-sed -i 's/^REPOSITORY_NAME=/REPOSITORY_NAME=hivedev/' \
-  /usr/lib/ranger/ranger-hive-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.ENABLE=false/XAAUDIT.SOLR.ENABLE=true/' \
-  /usr/lib/ranger/ranger-hive-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.URL=NONE/XAAUDIT.SOLR.URL=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-  /usr/lib/ranger/ranger-hive-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.USER=NONE/XAAUDIT.SOLR.USER=solr/' \
-  /usr/lib/ranger/ranger-hive-plugin/install.properties
+  systemctl stop hive-server2.service
+  systemctl stop hive-metastore.service
+  systemctl start hive-metastore.service
+  systemctl start hive-server2.service
 
-mkdir -p hive
-ln -s /etc/hive/conf hive
-ln -s /usr/lib/hive/lib /usr/lib/ranger/hive
-
-cd /usr/lib/ranger/ranger-hive-plugin && ./enable-hive-plugin.sh
-systemctl stop hive-server2.service
-systemctl stop hive-metastore.service
-systemctl start hive-metastore.service
-systemctl start hive-server2.service
-
-cat << EOF > service-hive.json
+  cat << EOF > service-hive.json
 {
     "configs": {
         "password": "dataproc2019",
@@ -154,39 +157,24 @@ cat << EOF > service-hive.json
     "version": 1
 }
 EOF
-curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
-   -X POST -d @service-hive.json http://localhost:6080/service/public/v2/api/service
+  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+    -X POST -d @service-hive.json http://localhost:6080/service/public/v2/api/service
+}
 
-#ranger-yarn-plugin
-cd /usr/lib/ranger/
-tar -xf /tmp/apache-ranger-1.2.0/target/ranger-1.2.0-yarn-plugin.tar.gz \
-  && ln -s ranger-1.2.0-yarn-plugin ranger-yarn-plugin
+function add_yarn_plugin() {
+  download_and_install_component "ranger-yarn-plugin"
+  apply_common_plugin_configuration "ranger-yarn-plugin" "yarndev"
+  pushd ranger-yarn-plugin && ./enable-yarn-plugin.sh && popd
 
-sed -i 's/^POLICY_MGR_URL=/POLICY_MGR_URL=http:\/\/localhost:6080/' \
-  /usr/lib/ranger/ranger-yarn-plugin/install.properties
-sed -i 's/^REPOSITORY_NAME=/REPOSITORY_NAME=yarndev/' \
-  /usr/lib/ranger/ranger-yarn-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.ENABLE=false/XAAUDIT.SOLR.ENABLE=true/' \
-  /usr/lib/ranger/ranger-yarn-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.URL=NONE/XAAUDIT.SOLR.URL=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-  /usr/lib/ranger/ranger-yarn-plugin/install.properties
-sed -i 's/^XAAUDIT.SOLR.USER=NONE/XAAUDIT.SOLR.USER=solr/' \
-  /usr/lib/ranger/ranger-yarn-plugin/install.properties
+  systemctl stop hadoop-yarn-resourcemanager.service
+  systemctl start hadoop-yarn-resourcemanager.service
 
-cd /usr/lib/ranger/ranger-yarn-plugin && ./enable-yarn-plugin.sh
-#systemctl stop hadoop-yarn-nodemanager.service
-systemctl stop hadoop-yarn-resourcemanager.service
-#systemctl stop hadoop-yarn-timelineserver.service
-#systemctl start hadoop-yarn-nodemanager.service
-systemctl start hadoop-yarn-resourcemanager.service
-#systemctl start hadoop-yarn-timelineserver.service
-
-cat << EOF > service-yarn.json
+  cat << EOF > service-yarn.json
 {
     "configs": {
         "password": "dataproc2019",
         "username": "admin",
-	    "yarn.url": "http://${NODE_NAME}:8088"
+        "yarn.url": "http://${NODE_NAME}:8088"
         },
     "description": "Hadoop YARN service",
     "isEnabled": true,
@@ -196,5 +184,23 @@ cat << EOF > service-yarn.json
 }
 EOF
 
-curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
-   -X POST -d @service-yarn.json http://localhost:6080/service/public/v2/api/service
+  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+    -X POST -d @service-yarn.json http://localhost:6080/service/public/v2/api/service
+}
+
+function main() {
+  local role
+  role="$(/usr/share/google/get_metadata_value attributes/dataproc-role)"
+  mkdir -p "${RANGER_INSTALL_DIR}" && cd "${RANGER_INSTALL_DIR}"
+
+  if [[ "${role}" == 'Master' ]]; then
+    run_ranger_admin
+    add_usersync_plugin
+    add_hdfs_plugin
+    add_hive_plugin
+    add_yarn_plugin
+  fi
+
+}
+
+main

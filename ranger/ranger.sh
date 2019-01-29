@@ -17,11 +17,12 @@
 
 set -euxo pipefail
 
-readonly SOLR_HOME='/opt/solr'
-readonly RANGER_GCS_BUCKET='apache-ranger-1-2-0-artifacts'
 readonly NODE_NAME="$(/usr/share/google/get_metadata_value name)"
+readonly RANGER_ADMIN_PASS='dataproc2019'
+readonly RANGER_GCS_BUCKET='apache-ranger-1-2-0-artifacts'
 readonly RANGER_INSTALL_DIR='/usr/lib/ranger'
 readonly RANGER_VERSION='1.2.0'
+readonly SOLR_HOME='/opt/solr'
 
 function download_and_install_component() {
   local full_component_name="$(echo ${1} | sed "s/^ranger/ranger-${RANGER_VERSION}/")"
@@ -33,19 +34,19 @@ function download_and_install_component() {
 
 function configure_admin() {
   sed -i 's/^db_root_password=/db_root_password=root-password/' \
-    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
   sed -i 's/^db_password=/db_password=rangerpass/' \
-    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
-  sed -i 's/^rangerAdmin_password=/rangerAdmin_password=dataproc2019/' \
-    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
+  sed -i "s/^rangerAdmin_password=/rangerAdmin_password=${RANGER_ADMIN_PASS}/" \
+    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
   sed -i 's/^audit_solr_urls=/audit_solr_urls=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
   sed -i 's/^audit_solr_user=/audit_solr_user=solr/' \
-    ${RANGER_INSTALL_DIR}/ranger-admin/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
 
   mysql -u root -proot-password -e "CREATE USER 'rangeradmin'@'localhost' IDENTIFIED BY 'rangerpass';"
   mysql -u root -proot-password -e "CREATE DATABASE ranger;"
-  mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost' ;"
+  mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost';"
 
   runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
 }
@@ -64,11 +65,11 @@ function add_usersync_plugin() {
     && chgrp ranger /var/log/ranger-usersync
 
   sed -i 's/^logdir=logs/logdir=\/var\/log\/ranger-usersync/' \
-    ${RANGER_INSTALL_DIR}/ranger-usersync/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-usersync/install.properties"
   sed -i 's/^POLICY_MGR_URL =/POLICY_MGR_URL = http:\/\/localhost:6080/' \
-    ${RANGER_INSTALL_DIR}/ranger-usersync/install.properties
+    "${RANGER_INSTALL_DIR}/ranger-usersync/install.properties"
 
-  pushd ${RANGER_INSTALL_DIR}/ranger-usersync && ./setup.sh
+  pushd "${RANGER_INSTALL_DIR}/ranger-usersync" && ./setup.sh
   ranger-usersync start
   popd
 }
@@ -94,7 +95,7 @@ function apply_common_plugin_configuration() {
 
 function add_hdfs_plugin() {
   download_and_install_component "ranger-hdfs-plugin"
-  apply_common_plugin_configuration "ranger-hdfs-plugin" "hadoopdev"
+  apply_common_plugin_configuration "ranger-hdfs-plugin" "hadoop-dataproc"
 
   mkdir -p "${RANGER_INSTALL_DIR}/hadoop/etc" "${RANGER_INSTALL_DIR}/hadoop/share/hadoop/hdfs/"
   ln -s /etc/hadoop/conf "${RANGER_INSTALL_DIR}/hadoop/etc/hadoop"
@@ -102,68 +103,62 @@ function add_hdfs_plugin() {
 
   pushd ranger-hdfs-plugin && ./enable-hdfs-plugin.sh && popd
 
-  systemctl stop hadoop-hdfs-datanode.service
-  systemctl stop hadoop-hdfs-secondarynamenode.service
   systemctl stop hadoop-hdfs-namenode.service
   systemctl start hadoop-hdfs-namenode.service
-  systemctl start hadoop-hdfs-secondarynamenode.service
-  systemctl start hadoop-hdfs-datanode.service
 
 cat << EOF > service-hdfs.json
 {
     "configs": {
-        "password": "dataproc2019",
         "username": "admin",
+        "password": "${RANGER_ADMIN_PASS}",
         "hadoop.security.authentication": "Simple",
         "hadoop.security.authorization": "No",
         "fs.default.name": "hdfs://${NODE_NAME}:8020"
         },
     "description": "Hadoop hdfs service",
     "isEnabled": true,
-    "name": "hadoopdev",
+    "name": "hadoop-dataproc",
     "type": "hdfs",
     "version": 1
 }
 EOF
-  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+  curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
     -X POST -d @service-hdfs.json http://localhost:6080/service/public/v2/api/service
 }
 
 function add_hive_plugin() {
   download_and_install_component "ranger-hive-plugin"
-  apply_common_plugin_configuration "ranger-hive-plugin" "hivedev"
+  apply_common_plugin_configuration "ranger-hive-plugin" "hive-dataproc"
   mkdir -p hive \
     && ln -s /etc/hive/conf hive \
     && ln -s /usr/lib/hive/lib hive
   pushd ranger-hive-plugin && ./enable-hive-plugin.sh && popd
 
   systemctl stop hive-server2.service
-  systemctl stop hive-metastore.service
-  systemctl start hive-metastore.service
   systemctl start hive-server2.service
 
   cat << EOF > service-hive.json
 {
     "configs": {
-        "password": "dataproc2019",
         "username": "admin",
+        "password": "${RANGER_ADMIN_PASS}",
         "jdbc.driverClassName" : "org.apache.hive.jdbc.HiveDriver",
         "jdbc.url" : "jdbc:mysql://localhost"
         },
     "description": "Hadoop HIVE service",
     "isEnabled": true,
-    "name": "hivedev",
+    "name": "hive-dataproc",
     "type": "hive",
     "version": 1
 }
 EOF
-  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+  curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
     -X POST -d @service-hive.json http://localhost:6080/service/public/v2/api/service
 }
 
 function add_yarn_plugin() {
   download_and_install_component "ranger-yarn-plugin"
-  apply_common_plugin_configuration "ranger-yarn-plugin" "yarndev"
+  apply_common_plugin_configuration "ranger-yarn-plugin" "yarn-dataproc"
   pushd ranger-yarn-plugin && ./enable-yarn-plugin.sh && popd
 
   systemctl stop hadoop-yarn-resourcemanager.service
@@ -172,19 +167,19 @@ function add_yarn_plugin() {
   cat << EOF > service-yarn.json
 {
     "configs": {
-        "password": "dataproc2019",
         "username": "admin",
+        "password": "${RANGER_ADMIN_PASS}",
         "yarn.url": "http://${NODE_NAME}:8088"
         },
     "description": "Hadoop YARN service",
     "isEnabled": true,
-    "name": "yarndev",
+    "name": "yarn-dataproc",
     "type": "yarn",
     "version": 1
 }
 EOF
 
-  curl --user admin:dataproc2019 -H "Content-Type: application/json"  \
+  curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
     -X POST -d @service-yarn.json http://localhost:6080/service/public/v2/api/service
 }
 
@@ -193,7 +188,7 @@ function main() {
   role="$(/usr/share/google/get_metadata_value attributes/dataproc-role)"
   mkdir -p "${RANGER_INSTALL_DIR}" && cd "${RANGER_INSTALL_DIR}"
 
-  if [[ "${role}" == 'Master' ]]; then
+  if [[ "${role}" == 'Master' && "${NODE_NAME}" =~ ^.*(-m|-m-0)$ ]]; then
     run_ranger_admin
     add_usersync_plugin
     add_hdfs_plugin

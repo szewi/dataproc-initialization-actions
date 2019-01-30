@@ -23,6 +23,7 @@ readonly RANGER_GCS_BUCKET='apache-ranger-1-2-0-artifacts'
 readonly RANGER_INSTALL_DIR='/usr/lib/ranger'
 readonly RANGER_VERSION='1.2.0'
 readonly SOLR_HOME='/opt/solr'
+readonly MASTER_ADDITIONAL="$(/usr/share/google/get_metadata_value attributes/dataproc-master-additional)"
 
 function download_and_install_component() {
   local full_component_name="$(echo ${1} | sed "s/^ranger/ranger-${RANGER_VERSION}/")"
@@ -48,7 +49,11 @@ function configure_admin() {
   mysql -u root -proot-password -e "CREATE DATABASE ranger;"
   mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost';"
 
-  runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
+  if [[ "${MASTER_ADDITIONAL}" != "" ]] ; then
+    runuser -l solr -c "${SOLR_HOME}/bin/solr create_collection -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 3"
+  else
+    runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
+  fi
 }
 
 function run_ranger_admin() {

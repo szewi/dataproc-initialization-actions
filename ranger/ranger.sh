@@ -24,6 +24,7 @@ readonly RANGER_INSTALL_DIR='/usr/lib/ranger'
 readonly RANGER_VERSION='1.2.0'
 readonly SOLR_HOME='/opt/solr'
 readonly MASTER_ADDITIONAL="$(/usr/share/google/get_metadata_value attributes/dataproc-master-additional)"
+readonly CLUSTER_NAME="$(/usr/share/google/get_metadata_value attributes/dataproc-cluster-name)"
 
 function download_and_install_component() {
   local full_component_name="$(echo ${1} | sed "s/^ranger/ranger-${RANGER_VERSION}/")"
@@ -40,8 +41,6 @@ function configure_admin() {
     "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
   sed -i "s/^rangerAdmin_password=/rangerAdmin_password=${RANGER_ADMIN_PASS}/" \
     "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
-  sed -i 's/^audit_solr_urls=/audit_solr_urls=http:\/\/localhost:8983\/solr\/ranger_audits/' \
-    "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
   sed -i 's/^audit_solr_user=/audit_solr_user=solr/' \
     "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
 
@@ -50,8 +49,14 @@ function configure_admin() {
   mysql -u root -proot-password -e "GRANT ALL PRIVILEGES ON ranger.* TO 'rangeradmin'@'localhost';"
 
   if [[ "${MASTER_ADDITIONAL}" != "" ]] ; then
+    sed -i "s/^audit_solr_zookeepers=/audit_solr_zookeepers=${CLUSTER_NAME}-m-0:2181,${CLUSTER_NAME}-m-1:2181,${CLUSTER_NAME}-m-2:2181\/solr/" \
+      "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
+    sed -i 's/^audit_solr_urls=/audit_solr_urls=none/' \
+      "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
     runuser -l solr -c "${SOLR_HOME}/bin/solr create_collection -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 3"
   else
+    sed -i 's/^audit_solr_urls=/audit_solr_urls=http:\/\/localhost:8983\/solr\/ranger_audits/' \
+      "${RANGER_INSTALL_DIR}/ranger-admin/install.properties"
     runuser -l solr -c "${SOLR_HOME}/bin/solr create_core -c ranger_audits -d ${RANGER_INSTALL_DIR}/ranger-admin/contrib/solr_for_audit_setup/conf -shards 1 -replicationFactor 1"
   fi
 }
@@ -59,7 +64,7 @@ function configure_admin() {
 function run_ranger_admin() {
   download_and_install_component "ranger-admin"
   configure_admin
-  pushd "${RANGER_INSTALL_DIR}/ranger-admin" && ./setup.sh
+  pushd "${RANGER_INSTALL_DIR}/ranger-admin" && ./set_globals.sh && ./setup.sh
   ranger-admin start
   popd
 }
@@ -96,6 +101,10 @@ function apply_common_plugin_configuration() {
     "${RANGER_INSTALL_DIR}/${1}/install.properties"
   sed -i 's/^XAAUDIT.SOLR.USER=NONE/XAAUDIT.SOLR.USER=solr/' \
     "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  if [[ "${MASTER_ADDITIONAL}" != "" ]]; then
+    sed -i "s/^XAAUDIT.SOLR.ZOOKEEPER=NONE/XAAUDIT.SOLR.ZOOKEEPER=${CLUSTER_NAME}-m-0:2181,${CLUSTER_NAME}-m-1:2181,${CLUSTER_NAME}-m-2:2181\/solr/" \
+      "${RANGER_INSTALL_DIR}/${1}/install.properties"
+  fi
 }
 
 function add_hdfs_plugin() {
@@ -108,10 +117,17 @@ function add_hdfs_plugin() {
 
   pushd ranger-hdfs-plugin && ./enable-hdfs-plugin.sh && popd
 
-  systemctl stop hadoop-hdfs-namenode.service
-  systemctl start hadoop-hdfs-namenode.service
+  if [[ "${NODE_NAME}" =~ ^.*(-m|-m-0)$ ]]; then
+    systemctl stop hadoop-hdfs-namenode.service
+    systemctl start hadoop-hdfs-namenode.service
 
-cat << EOF > service-hdfs.json
+    # Notify cluster that plugin is installed on master.
+    until hadoop fs -touchz /tmp/ranger-hdfs-plugin-ready  &> /dev/null
+    do
+      sleep 10
+    done
+
+    cat << EOF > service-hdfs.json
 {
     "configs": {
         "username": "admin",
@@ -127,8 +143,17 @@ cat << EOF > service-hdfs.json
     "version": 1
 }
 EOF
-  curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
-    -X POST -d @service-hdfs.json http://localhost:6080/service/public/v2/api/service
+    curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
+      -X POST -d @service-hdfs.json http://localhost:6080/service/public/v2/api/service
+  elif [[ "${NODE_NAME}" =~ ^.*(-m-1)$ ]]; then
+    # Waiting until hdfs plugin will be configured on m-0
+    until hadoop fs -get -f /tmp/ranger-hdfs-plugin-ready &> /dev/null
+    do
+	  sleep 10
+    done
+    systemctl stop hadoop-hdfs-namenode.service
+    systemctl start hadoop-hdfs-namenode.service
+  fi
 }
 
 function add_hive_plugin() {
@@ -166,10 +191,17 @@ function add_yarn_plugin() {
   apply_common_plugin_configuration "ranger-yarn-plugin" "yarn-dataproc"
   pushd ranger-yarn-plugin && ./enable-yarn-plugin.sh && popd
 
-  systemctl stop hadoop-yarn-resourcemanager.service
-  systemctl start hadoop-yarn-resourcemanager.service
+  if [[ "${NODE_NAME}" =~ ^.*(-m|-m-0)$ ]]; then
+    systemctl stop hadoop-yarn-resourcemanager.service
+    systemctl start hadoop-yarn-resourcemanager.service
 
-  cat << EOF > service-yarn.json
+    # Notify cluster that yarn plugin is installed on master.
+    until hadoop fs -touchz /tmp/ranger-yarn-plugin-ready  &> /dev/null
+    do
+	  sleep 10
+    done
+
+    cat << EOF > service-yarn.json
 {
     "configs": {
         "username": "admin",
@@ -183,9 +215,17 @@ function add_yarn_plugin() {
     "version": 1
 }
 EOF
-
-  curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
-    -X POST -d @service-yarn.json http://localhost:6080/service/public/v2/api/service
+    curl --user "admin:${RANGER_ADMIN_PASS}" -H "Content-Type: application/json"  \
+      -X POST -d @service-yarn.json http://localhost:6080/service/public/v2/api/service
+  elif [[ "${NODE_NAME}" =~ ^.*(-m-1|-m-2)$ ]]; then
+    # Waiting until yarn plugin will be configured on m-0
+    until hadoop fs -get -f /tmp/ranger-yarn-plugin-ready &> /dev/null
+    do
+	  sleep 10
+    done
+    systemctl stop hadoop-yarn-resourcemanager.service
+    systemctl start hadoop-yarn-resourcemanager.service
+  fi
 }
 
 function main() {
@@ -201,6 +241,17 @@ function main() {
     add_yarn_plugin
   fi
 
+  # In HA clusters Namenode is installed also on m-1. We also need to install and configure
+  # ranger hdfs plugin on m-1.
+  if [[ "${role}" == 'Master' && "${NODE_NAME}" =~ ^.*(-m-1)$ ]]; then
+    add_hdfs_plugin
+  fi
+
+  # In HA clusters ResourceManager is installed also on m-1 and m-2.
+  # We also need to install and configure ranger yarn plugin on additional masters.
+  if [[ "${role}" == 'Master' && "${NODE_NAME}" =~ ^.*(-m-1|-m-2)$ ]]; then
+    add_yarn_plugin
+  fi
 }
 
 main
